@@ -1,6 +1,7 @@
 import { loadConfig } from "../config/config.js";
 import type { OpenClawConfig } from "../config/config.js";
 import { emitDiagnosticEvent } from "../infra/diagnostic-events.js";
+import { getCurrentDiagnosticTraceContext } from "../infra/diagnostic-trace.js";
 import {
   diagnosticSessionStates,
   getDiagnosticSessionState,
@@ -178,6 +179,7 @@ export function logMessageProcessed(params: {
   }
   emitDiagnosticEvent({
     type: "message.processed",
+    ...getCurrentDiagnosticTraceContext(),
     channel: params.channel,
     chatId: params.chatId,
     messageId: params.messageId,
