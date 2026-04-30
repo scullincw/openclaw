@@ -6,7 +6,7 @@ const telemetryState = vi.hoisted(() => {
   const counters = new Map<string, { add: ReturnType<typeof vi.fn> }>();
   const histograms = new Map<string, { record: ReturnType<typeof vi.fn> }>();
   const tracer = {
-    startSpan: vi.fn((_name: string, _opts?: unknown) => ({
+    startSpan: vi.fn((_name: string, _opts?: unknown, _context?: unknown) => ({
       end: vi.fn(),
       setStatus: vi.fn(),
     })),
@@ -33,11 +33,13 @@ const logShutdown = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const traceExporterCtor = vi.hoisted(() => vi.fn());
 
 vi.mock("@opentelemetry/api", () => ({
+  ROOT_CONTEXT: {},
   metrics: {
     getMeter: () => telemetryState.meter,
   },
   trace: {
     getTracer: () => telemetryState.tracer,
+    setSpan: vi.fn((context, span) => ({ ...context, span })),
   },
   SpanStatusCode: {
     ERROR: 2,
@@ -259,8 +261,8 @@ describe("diagnostics-otel service", () => {
 
     const spanNames = telemetryState.tracer.startSpan.mock.calls.map((call) => call[0]);
     expect(spanNames).toContain("openclaw.webhook.processed");
-    expect(spanNames).toContain("openclaw.message.processed");
     expect(spanNames).toContain("openclaw.session.stuck");
+    expect(spanNames).not.toContain("openclaw.message.processed");
 
     expect(registerLogTransportMock).toHaveBeenCalledTimes(1);
     expect(registeredTransports).toHaveLength(1);
@@ -270,6 +272,96 @@ describe("diagnostics-otel service", () => {
       _meta: { logLevelName: "INFO", date: new Date() },
     });
     expect(logEmit).toHaveBeenCalled();
+
+    await service.stop?.(ctx);
+  });
+
+  test("links contextual diagnostic events to the active trace span", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    emitDiagnosticEvent({
+      type: "trace.span.start",
+      traceKey: "trace-1",
+      spanKey: "root-span",
+      name: "feishu.inbound.receive",
+      startTimeMs: Date.now() - 2_000,
+      channel: "feishu",
+      messageId: "msg-1",
+    });
+    emitDiagnosticEvent({
+      type: "message.processed",
+      traceKey: "trace-1",
+      parentSpanKey: "root-span",
+      channel: "feishu",
+      messageId: "msg-1",
+      outcome: "completed",
+      durationMs: 1_000,
+    });
+    emitDiagnosticEvent({
+      type: "model.usage",
+      traceKey: "trace-1",
+      parentSpanKey: "root-span",
+      channel: "feishu",
+      provider: "openai-codex",
+      model: "gpt-5.4",
+      usage: {
+        input: 10,
+        output: 5,
+        total: 15,
+      },
+      durationMs: 900,
+    });
+
+    const calls = telemetryState.tracer.startSpan.mock.calls;
+    const messageCall = calls.find((call) => call[0] === "openclaw.message.processed");
+    const usageCall = calls.find((call) => call[0] === "openclaw.model.usage");
+
+    expect(messageCall?.[2]).toEqual(expect.objectContaining({ span: expect.any(Object) }));
+    expect(usageCall?.[2]).toEqual(expect.objectContaining({ span: expect.any(Object) }));
+    expect(usageCall?.[1]).toEqual(
+      expect.objectContaining({
+        attributes: expect.objectContaining({
+          "openclaw.tokens.input": 10,
+          "openclaw.tokens.output": 5,
+          "openclaw.tokens.total": 15,
+        }),
+      }),
+    );
+
+    await service.stop?.(ctx);
+  });
+
+  test("does not create standalone spans for contextual events without active parents", async () => {
+    const service = createDiagnosticsOtelService();
+    const ctx = createOtelContext(OTEL_TEST_ENDPOINT, { traces: true, metrics: true });
+    await service.start(ctx);
+
+    emitDiagnosticEvent({
+      type: "message.processed",
+      channel: "feishu",
+      outcome: "completed",
+      durationMs: 1_000,
+    });
+    emitDiagnosticEvent({
+      type: "model.usage",
+      channel: "feishu",
+      provider: "openai-codex",
+      model: "gpt-5.4",
+      usage: {
+        input: 10,
+        output: 5,
+        total: 15,
+      },
+      durationMs: 900,
+    });
+
+    const spanNames = telemetryState.tracer.startSpan.mock.calls.map((call) => call[0]);
+    expect(spanNames).not.toContain("openclaw.message.processed");
+    expect(spanNames).not.toContain("openclaw.model.usage");
+    expect(telemetryState.counters.get("openclaw.message.processed")?.add).toHaveBeenCalled();
+    expect(telemetryState.counters.get("openclaw.tokens")?.add).toHaveBeenCalled();
 
     await service.stop?.(ctx);
   });
