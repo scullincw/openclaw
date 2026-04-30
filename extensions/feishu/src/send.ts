@@ -1,5 +1,6 @@
 import { resolveMarkdownTableMode } from "openclaw/plugin-sdk/config-runtime";
 import { convertMarkdownTables } from "openclaw/plugin-sdk/text-runtime";
+import { withDiagnosticSpan } from "../../../src/infra/diagnostic-trace.js";
 import type { ClawdbotConfig } from "../runtime-api.js";
 import { resolveFeishuRuntimeAccount } from "./accounts.js";
 import { createFeishuClient } from "./client.js";
@@ -108,16 +109,34 @@ async function sendFallbackDirect(
   },
   errorPrefix: string,
 ): Promise<FeishuSendResult> {
-  const response = await client.im.message.create({
-    params: { receive_id_type: params.receiveIdType },
-    data: {
-      receive_id: params.receiveId,
-      content: params.content,
+  return await withDiagnosticSpan(
+    "feishu.outbound.create",
+    {
+      receive_id_type: params.receiveIdType,
       msg_type: params.msgType,
     },
-  });
-  assertFeishuMessageApiSuccess(response, errorPrefix);
-  return toFeishuSendResult(response, params.receiveId);
+    async () => {
+      const response = await client.im.message.create({
+        params: { receive_id_type: params.receiveIdType },
+        data: {
+          receive_id: params.receiveId,
+          content: params.content,
+          msg_type: params.msgType,
+        },
+      });
+      return await withDiagnosticSpan(
+        "feishu.outbound.ack",
+        {
+          method: "create",
+          code: response.code ?? -1,
+        },
+        async () => {
+          assertFeishuMessageApiSuccess(response, errorPrefix);
+          return toFeishuSendResult(response, params.receiveId);
+        },
+      );
+    },
+  );
 }
 
 async function sendReplyOrFallbackDirect(
@@ -137,43 +156,71 @@ async function sendReplyOrFallbackDirect(
     replyErrorPrefix: string;
   },
 ): Promise<FeishuSendResult> {
-  if (!params.replyToMessageId) {
-    return sendFallbackDirect(client, params.directParams, params.directErrorPrefix);
-  }
+  return await withDiagnosticSpan(
+    "feishu.outbound.send",
+    {
+      receive_id_type: params.directParams.receiveIdType,
+      msg_type: params.msgType,
+      is_reply: Boolean(params.replyToMessageId),
+      reply_in_thread: params.replyInThread === true,
+    },
+    async () => {
+      if (!params.replyToMessageId) {
+        return sendFallbackDirect(client, params.directParams, params.directErrorPrefix);
+      }
 
-  const threadReplyFallbackError = params.replyInThread
-    ? new Error(
-        "Feishu thread reply failed: reply target is unavailable and cannot safely fall back to a top-level send.",
-      )
-    : null;
+      const threadReplyFallbackError = params.replyInThread
+        ? new Error(
+            "Feishu thread reply failed: reply target is unavailable and cannot safely fall back to a top-level send.",
+          )
+        : null;
 
-  let response: { code?: number; msg?: string; data?: { message_id?: string } };
-  try {
-    response = await client.im.message.reply({
-      path: { message_id: params.replyToMessageId },
-      data: {
-        content: params.content,
-        msg_type: params.msgType,
-        ...(params.replyInThread ? { reply_in_thread: true } : {}),
-      },
-    });
-  } catch (err) {
-    if (!isWithdrawnReplyError(err)) {
-      throw err;
-    }
-    if (threadReplyFallbackError) {
-      throw threadReplyFallbackError;
-    }
-    return sendFallbackDirect(client, params.directParams, params.directErrorPrefix);
-  }
-  if (shouldFallbackFromReplyTarget(response)) {
-    if (threadReplyFallbackError) {
-      throw threadReplyFallbackError;
-    }
-    return sendFallbackDirect(client, params.directParams, params.directErrorPrefix);
-  }
-  assertFeishuMessageApiSuccess(response, params.replyErrorPrefix);
-  return toFeishuSendResult(response, params.directParams.receiveId);
+      let response: { code?: number; msg?: string; data?: { message_id?: string } };
+      try {
+        response = await withDiagnosticSpan(
+          "feishu.outbound.reply",
+          {
+            msg_type: params.msgType,
+            reply_in_thread: params.replyInThread === true,
+          },
+          async () =>
+            await client.im.message.reply({
+              path: { message_id: params.replyToMessageId! },
+              data: {
+                content: params.content,
+                msg_type: params.msgType,
+                ...(params.replyInThread ? { reply_in_thread: true } : {}),
+              },
+            }),
+        );
+      } catch (err) {
+        if (!isWithdrawnReplyError(err)) {
+          throw err;
+        }
+        if (threadReplyFallbackError) {
+          throw threadReplyFallbackError;
+        }
+        return sendFallbackDirect(client, params.directParams, params.directErrorPrefix);
+      }
+      if (shouldFallbackFromReplyTarget(response)) {
+        if (threadReplyFallbackError) {
+          throw threadReplyFallbackError;
+        }
+        return sendFallbackDirect(client, params.directParams, params.directErrorPrefix);
+      }
+      return await withDiagnosticSpan(
+        "feishu.outbound.ack",
+        {
+          method: "reply",
+          code: response.code ?? -1,
+        },
+        async () => {
+          assertFeishuMessageApiSuccess(response, params.replyErrorPrefix);
+          return toFeishuSendResult(response, params.directParams.receiveId);
+        },
+      );
+    },
+  );
 }
 
 function parseInteractiveCardContent(parsed: unknown): string {
