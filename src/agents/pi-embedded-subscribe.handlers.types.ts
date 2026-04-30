@@ -1,6 +1,7 @@
 import type { AgentEvent, AgentMessage } from "@mariozechner/pi-agent-core";
 import type { ReplyDirectiveParseResult } from "../auto-reply/reply/reply-directives.js";
 import type { ReasoningLevel } from "../auto-reply/thinking.js";
+import type { DiagnosticSpanHandle } from "../infra/diagnostic-trace.js";
 import type { InlineCodeState } from "../markdown/code-spans.js";
 import type { HookRunner } from "../plugins/hooks.js";
 import type { EmbeddedBlockChunker } from "./pi-embedded-block-chunker.js";
@@ -67,6 +68,7 @@ export type EmbeddedPiSubscribeState = {
   compactionRetryResolve?: () => void;
   compactionRetryReject?: (reason?: unknown) => void;
   compactionRetryPromise: Promise<void> | null;
+  compactionSpan?: DiagnosticSpanHandle | null;
   unsubscribed: boolean;
 
   messagingToolSentTexts: string[];

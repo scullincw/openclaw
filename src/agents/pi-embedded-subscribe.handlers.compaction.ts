@@ -1,12 +1,17 @@
 import type { AgentEvent } from "@mariozechner/pi-agent-core";
 import { resolveStorePath, updateSessionStoreEntry } from "../config/sessions.js";
 import { emitAgentEvent } from "../infra/agent-events.js";
+import { endDiagnosticSpan, startDiagnosticSpan } from "../infra/diagnostic-trace.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
 import type { EmbeddedPiSubscribeContext } from "./pi-embedded-subscribe.handlers.types.js";
 import { makeZeroUsageSnapshot } from "./usage.js";
 
 export function handleAutoCompactionStart(ctx: EmbeddedPiSubscribeContext) {
   ctx.state.compactionInFlight = true;
+  ctx.state.compactionSpan = startDiagnosticSpan("openclaw.context.compact", {
+    run_id: ctx.params.runId,
+    ...(ctx.params.sessionKey ? { session_key: ctx.params.sessionKey } : {}),
+  });
   ctx.ensureCompactionPromise();
   ctx.log.debug(`embedded run compaction start: runId=${ctx.params.runId}`);
   emitAgentEvent({
@@ -44,6 +49,8 @@ export function handleAutoCompactionEnd(
   evt: AgentEvent & { willRetry?: unknown; result?: unknown; aborted?: unknown },
 ) {
   ctx.state.compactionInFlight = false;
+  const compactionSpan = ctx.state.compactionSpan;
+  ctx.state.compactionSpan = null;
   const willRetry = Boolean(evt.willRetry);
   // Increment counter whenever compaction actually produced a result,
   // regardless of willRetry.  Overflow-triggered compaction sets willRetry=true
@@ -71,6 +78,15 @@ export function handleAutoCompactionEnd(
     ctx.maybeResolveCompactionWait();
     clearStaleAssistantUsageOnSessionMessages(ctx);
   }
+  endDiagnosticSpan(compactionSpan, {
+    status: wasAborted ? "error" : "ok",
+    ...(wasAborted ? { error: "compaction aborted" } : {}),
+    attributes: {
+      will_retry: willRetry,
+      completed: hasResult && !wasAborted,
+      aborted: wasAborted,
+    },
+  });
   emitAgentEvent({
     runId: ctx.params.runId,
     stream: "compaction",

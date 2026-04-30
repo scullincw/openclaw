@@ -1,6 +1,11 @@
 import type { AgentEvent } from "@mariozechner/pi-agent-core";
 import { emitAgentEvent } from "../infra/agent-events.js";
 import {
+  endDiagnosticSpan,
+  startDiagnosticSpan,
+  type DiagnosticSpanHandle,
+} from "../infra/diagnostic-trace.js";
+import {
   buildExecApprovalPendingReplyPayload,
   buildExecApprovalUnavailableReplyPayload,
 } from "../infra/exec-approval-reply.js";
@@ -29,6 +34,7 @@ import { normalizeToolName } from "./tool-policy.js";
 type ToolStartRecord = {
   startTime: number;
   args: unknown;
+  traceSpan?: DiagnosticSpanHandle | null;
 };
 
 /** Track tool execution start data for after_tool_call hook. */
@@ -343,7 +349,17 @@ export async function handleToolExecutionStart(
   const runId = ctx.params.runId;
 
   // Track start time and args for after_tool_call hook
-  toolStartData.set(buildToolStartKey(runId, toolCallId), { startTime: Date.now(), args });
+  toolStartData.set(buildToolStartKey(runId, toolCallId), {
+    startTime: Date.now(),
+    args,
+    traceSpan: startDiagnosticSpan("openclaw.tool.execute", {
+      tool_name: toolName,
+      tool_call_id: toolCallId,
+      run_id: runId,
+      ...(ctx.params.sessionKey ? { session_key: ctx.params.sessionKey } : {}),
+      ...(ctx.params.agentId ? { agent_id: ctx.params.agentId } : {}),
+    }),
+  });
 
   if (toolName === "read") {
     const record = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
@@ -575,6 +591,18 @@ export async function handleToolExecutionEnd(
   ctx.log.debug(
     `embedded run tool end: runId=${ctx.params.runId} tool=${toolName} toolCallId=${toolCallId}`,
   );
+
+  endDiagnosticSpan(startData?.traceSpan, {
+    status: isToolError ? "error" : "ok",
+    ...(isToolError
+      ? { error: extractToolErrorMessage(sanitizedResult) ?? "tool execution failed" }
+      : {}),
+    attributes: {
+      tool_name: toolName,
+      tool_call_id: toolCallId,
+      ...(startData?.startTime != null ? { duration_ms: Date.now() - startData.startTime } : {}),
+    },
+  });
 
   await emitToolResultOutput({ ctx, toolName, meta, isToolError, result, sanitizedResult });
 
