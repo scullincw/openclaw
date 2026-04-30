@@ -9,6 +9,8 @@ type DiagnosticBaseEvent = {
 
 export type DiagnosticUsageEvent = DiagnosticBaseEvent & {
   type: "model.usage";
+  traceKey?: string;
+  parentSpanKey?: string;
   sessionKey?: string;
   sessionId?: string;
   channel?: string;
@@ -71,6 +73,8 @@ export type DiagnosticMessageQueuedEvent = DiagnosticBaseEvent & {
 
 export type DiagnosticMessageProcessedEvent = DiagnosticBaseEvent & {
   type: "message.processed";
+  traceKey?: string;
+  parentSpanKey?: string;
   channel: string;
   messageId?: number | string;
   chatId?: number | string;
@@ -147,6 +151,35 @@ export type DiagnosticToolLoopEvent = DiagnosticBaseEvent & {
   pairedToolName?: string;
 };
 
+export type DiagnosticTraceSpanStartEvent = DiagnosticBaseEvent & {
+  type: "trace.span.start";
+  traceKey: string;
+  spanKey: string;
+  parentSpanKey?: string;
+  name: string;
+  startTimeMs: number;
+  channel?: string;
+  messageId?: number | string;
+  chatId?: number | string;
+  sessionKey?: string;
+  sessionId?: string;
+  runId?: string;
+  provider?: string;
+  model?: string;
+  attributes?: Record<string, string | number | boolean>;
+};
+
+export type DiagnosticTraceSpanEndEvent = DiagnosticBaseEvent & {
+  type: "trace.span.end";
+  traceKey: string;
+  spanKey: string;
+  name?: string;
+  endTimeMs: number;
+  status?: "ok" | "error";
+  error?: string;
+  attributes?: Record<string, string | number | boolean>;
+};
+
 export type DiagnosticEventPayload =
   | DiagnosticUsageEvent
   | DiagnosticWebhookReceivedEvent
@@ -160,7 +193,9 @@ export type DiagnosticEventPayload =
   | DiagnosticLaneDequeueEvent
   | DiagnosticRunAttemptEvent
   | DiagnosticHeartbeatEvent
-  | DiagnosticToolLoopEvent;
+  | DiagnosticToolLoopEvent
+  | DiagnosticTraceSpanStartEvent
+  | DiagnosticTraceSpanEndEvent;
 
 export type DiagnosticEventInput = DiagnosticEventPayload extends infer Event
   ? Event extends DiagnosticEventPayload
