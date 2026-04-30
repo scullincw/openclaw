@@ -1,0 +1,166 @@
+name: Build OpenClaw Runtime
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/build-openclaw-runtime.yml"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional GitHub release tag. Leave empty to auto-generate one."
+        required: false
+        type: string
+      publish_release:
+        description: "Upload the runtime tarball to a GitHub Release."
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: build-openclaw-runtime-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  IMAGE_NAME: openclaw-runtime
+
+jobs:
+  build-linux-amd64-runtime:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24.x"
+
+      - name: Install archive tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zstd
+
+      - name: Free runner disk space
+        run: |
+          set -euo pipefail
+          df -h
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/share/swift || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /opt/hostedtoolcache/go || true
+          docker system prune -af || true
+          df -h
+
+      - name: Resolve artifact metadata
+        id: meta
+        shell: bash
+        env:
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          sha_short="$(git rev-parse --short=12 HEAD)"
+          stamp="$(date -u +%Y%m%d%H%M%S)"
+          artifact="openclaw-${version}-observability-${stamp}-${sha_short}-linux-amd64.tar.zst"
+          release_tag="${INPUT_RELEASE_TAG:-openclaw-custom-${version}-${stamp}-${sha_short}}"
+
+          {
+            echo "version=${version}"
+            echo "sha_short=${sha_short}"
+            echo "artifact=${artifact}"
+            echo "release_tag=${release_tag}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build linux/amd64 runtime image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.sha_short }}
+          cache-from: type=gha,scope=openclaw-runtime-amd64
+          cache-to: type=gha,mode=max,scope=openclaw-runtime-amd64
+          provenance: false
+          load: true
+
+      - name: Export /app runtime from image
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          container_id="$(docker create "${IMAGE_NAME}:${{ steps.meta.outputs.sha_short }}")"
+          trap 'docker rm -f "$container_id" >/dev/null 2>&1 || true' EXIT
+          docker cp "${container_id}:/app" .artifacts/openclaw
+
+      - name: Verify exported runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd .artifacts/openclaw
+          node openclaw.mjs --version
+          node openclaw.mjs gateway --help >/dev/null
+          test -d dist
+          test -d node_modules
+          test -d extensions
+          test -d skills
+
+      - name: Package runtime tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd .artifacts
+          tar --zstd -cf "${{ steps.meta.outputs.artifact }}" openclaw
+          sha256sum "${{ steps.meta.outputs.artifact }}" > "${{ steps.meta.outputs.artifact }}.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: openclaw-runtime-linux-amd64
+          path: |
+            .artifacts/${{ steps.meta.outputs.artifact }}
+            .artifacts/${{ steps.meta.outputs.artifact }}.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+          ARTIFACT: ${{ steps.meta.outputs.artifact }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          SHA_SHORT: ${{ steps.meta.outputs.sha_short }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="Custom OpenClaw runtime build.
+
+          Version: ${VERSION}
+          Commit: ${SHA_SHORT}
+          Platform: linux/amd64
+          "
+
+          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
+              --notes "${notes}"
+          fi
+
+          gh release upload "${RELEASE_TAG}" \
+            ".artifacts/${ARTIFACT}" \
+            ".artifacts/${ARTIFACT}.sha256" \
+            --clobber
