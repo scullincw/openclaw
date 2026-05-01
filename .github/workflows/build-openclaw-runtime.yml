@@ -1,25 +1,6 @@
 name: Build OpenClaw Runtime
 
 on:
-  push:
-    branches:
-      - openclaw-observability
-    paths:
-      - ".github/workflows/build-openclaw-runtime.yml"
-      - "Dockerfile"
-      - "package.json"
-      - "pnpm-lock.yaml"
-      - "pnpm-workspace.yaml"
-      - "tsconfig.json"
-      - "tsdown.config.ts"
-      - "openclaw.mjs"
-      - "src/**"
-      - "extensions/**"
-      - "skills/**"
-      - "packages/**"
-      - "patches/**"
-      - "scripts/**"
-      - "assets/**"
   workflow_dispatch:
     inputs:
       release_tag:
