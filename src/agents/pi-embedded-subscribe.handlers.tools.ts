@@ -39,9 +39,32 @@ type ToolStartRecord = {
 
 /** Track tool execution start data for after_tool_call hook. */
 const toolStartData = new Map<string, ToolStartRecord>();
+const lastToolEndByRun = new Map<
+  string,
+  {
+    endedAt: number;
+    toolName: string;
+    toolCallId: string;
+  }
+>();
 
 function buildToolStartKey(runId: string, toolCallId: string): string {
   return `${runId}:${toolCallId}`;
+}
+
+function endSpanWithStatus(
+  span: DiagnosticSpanHandle | null,
+  status: "ok" | "error",
+  attributes: Record<string, string | number | boolean>,
+  error?: unknown,
+) {
+  endDiagnosticSpan(span, {
+    status,
+    ...(status === "error"
+      ? { error: error instanceof Error ? (error.stack ?? error.message) : String(error) }
+      : {}),
+    attributes,
+  });
 }
 
 function isCronAddAction(args: unknown): boolean {
@@ -347,39 +370,81 @@ export async function handleToolExecutionStart(
   const toolCallId = String(evt.toolCallId);
   const args = evt.args;
   const runId = ctx.params.runId;
+  const toolAttributes = {
+    tool_name: toolName,
+    tool_call_id: toolCallId,
+    run_id: runId,
+    ...(ctx.params.sessionKey ? { session_key: ctx.params.sessionKey } : {}),
+    ...(ctx.params.agentId ? { agent_id: ctx.params.agentId } : {}),
+  };
+
+  const generatedSpan = startDiagnosticSpan("openclaw.tool.call.generated", toolAttributes);
+  endDiagnosticSpan(generatedSpan, { status: "ok", attributes: toolAttributes });
+
+  const previousToolEnd = lastToolEndByRun.get(runId);
+  if (previousToolEnd) {
+    const betweenToolsSpan = startDiagnosticSpan(
+      "openclaw.agent.between_tools",
+      {
+        previous_tool_name: previousToolEnd.toolName,
+        previous_tool_call_id: previousToolEnd.toolCallId,
+        next_tool_name: toolName,
+        next_tool_call_id: toolCallId,
+        run_id: runId,
+        ...(ctx.params.sessionKey ? { session_key: ctx.params.sessionKey } : {}),
+        ...(ctx.params.agentId ? { agent_id: ctx.params.agentId } : {}),
+      },
+      { startTimeMs: previousToolEnd.endedAt },
+    );
+    endDiagnosticSpan(betweenToolsSpan, {
+      status: "ok",
+      attributes: {
+        previous_tool_name: previousToolEnd.toolName,
+        previous_tool_call_id: previousToolEnd.toolCallId,
+        next_tool_name: toolName,
+        next_tool_call_id: toolCallId,
+        duration_ms: Math.max(0, Date.now() - previousToolEnd.endedAt),
+      },
+    });
+  }
 
   // Track start time and args for after_tool_call hook
   toolStartData.set(buildToolStartKey(runId, toolCallId), {
     startTime: Date.now(),
     args,
-    traceSpan: startDiagnosticSpan("openclaw.tool.execute", {
-      tool_name: toolName,
-      tool_call_id: toolCallId,
-      run_id: runId,
-      ...(ctx.params.sessionKey ? { session_key: ctx.params.sessionKey } : {}),
-      ...(ctx.params.agentId ? { agent_id: ctx.params.agentId } : {}),
-    }),
+    traceSpan: startDiagnosticSpan("openclaw.tool.execute", toolAttributes),
   });
 
-  if (toolName === "read") {
-    const record = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
-    const filePathValue =
-      typeof record.path === "string"
-        ? record.path
-        : typeof record.file_path === "string"
-          ? record.file_path
-          : "";
-    const filePath = filePathValue.trim();
-    if (!filePath) {
-      const argsPreview = typeof args === "string" ? args.slice(0, 200) : undefined;
-      ctx.log.warn(
-        `read tool called without path: toolCallId=${toolCallId} argsType=${typeof args}${argsPreview ? ` argsPreview=${argsPreview}` : ""}`,
-      );
+  const dispatchSpan = startDiagnosticSpan("openclaw.tool.dispatch", toolAttributes);
+  let meta: string | undefined;
+  try {
+    if (toolName === "read") {
+      const record = args && typeof args === "object" ? (args as Record<string, unknown>) : {};
+      const filePathValue =
+        typeof record.path === "string"
+          ? record.path
+          : typeof record.file_path === "string"
+            ? record.file_path
+            : "";
+      const filePath = filePathValue.trim();
+      if (!filePath) {
+        const argsPreview = typeof args === "string" ? args.slice(0, 200) : undefined;
+        ctx.log.warn(
+          `read tool called without path: toolCallId=${toolCallId} argsType=${typeof args}${argsPreview ? ` argsPreview=${argsPreview}` : ""}`,
+        );
+      }
     }
-  }
 
-  const meta = extendExecMeta(toolName, args, inferToolMetaFromArgs(toolName, args));
-  ctx.state.toolMetaById.set(toolCallId, buildToolCallSummary(toolName, args, meta));
+    meta = extendExecMeta(toolName, args, inferToolMetaFromArgs(toolName, args));
+    ctx.state.toolMetaById.set(toolCallId, buildToolCallSummary(toolName, args, meta));
+    endSpanWithStatus(dispatchSpan, "ok", {
+      ...toolAttributes,
+      ...(meta ? { tool_meta: meta } : {}),
+    });
+  } catch (err) {
+    endSpanWithStatus(dispatchSpan, "error", toolAttributes, err);
+    throw err;
+  }
   ctx.log.debug(
     `embedded run tool start: runId=${ctx.params.runId} tool=${toolName} toolCallId=${toolCallId}`,
   );
@@ -481,7 +546,22 @@ export async function handleToolExecutionEnd(
   const isError = Boolean(evt.isError);
   const result = evt.result;
   const isToolError = isError || isToolResultError(result);
-  const sanitizedResult = sanitizeToolResult(result);
+  const toolAttributes = {
+    tool_name: toolName,
+    tool_call_id: toolCallId,
+    run_id: runId,
+    ...(ctx.params.sessionKey ? { session_key: ctx.params.sessionKey } : {}),
+    ...(ctx.params.agentId ? { agent_id: ctx.params.agentId } : {}),
+  };
+  const serializeSpan = startDiagnosticSpan("openclaw.tool.result.serialize", toolAttributes);
+  let sanitizedResult: unknown;
+  try {
+    sanitizedResult = sanitizeToolResult(result);
+    endSpanWithStatus(serializeSpan, "ok", toolAttributes);
+  } catch (err) {
+    endSpanWithStatus(serializeSpan, "error", toolAttributes, err);
+    throw err;
+  }
   const toolStartKey = buildToolStartKey(runId, toolCallId);
   const startData = toolStartData.get(toolStartKey);
   toolStartData.delete(toolStartKey);
@@ -604,7 +684,27 @@ export async function handleToolExecutionEnd(
     },
   });
 
-  await emitToolResultOutput({ ctx, toolName, meta, isToolError, result, sanitizedResult });
+  const applyToolResultSpan = startDiagnosticSpan("openclaw.agent.apply_tool_result", {
+    ...toolAttributes,
+    ...(meta ? { tool_meta: meta } : {}),
+    is_error: isToolError,
+  });
+  try {
+    await emitToolResultOutput({ ctx, toolName, meta, isToolError, result, sanitizedResult });
+    endSpanWithStatus(applyToolResultSpan, "ok", {
+      ...toolAttributes,
+      ...(meta ? { tool_meta: meta } : {}),
+      is_error: isToolError,
+    });
+  } catch (err) {
+    endSpanWithStatus(applyToolResultSpan, "error", toolAttributes, err);
+    throw err;
+  }
+  lastToolEndByRun.set(runId, {
+    endedAt: Date.now(),
+    toolName,
+    toolCallId,
+  });
 
   // Run after_tool_call plugin hook (fire-and-forget)
   const hookRunnerAfter = ctx.hookRunner ?? getGlobalHookRunner();

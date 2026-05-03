@@ -71,9 +71,31 @@ export function handleAutoCompactionEnd(
     });
   }
   if (willRetry) {
-    ctx.noteCompactionRetry();
-    ctx.resetForCompactionRetry();
-    ctx.log.debug(`embedded run compaction retry: runId=${ctx.params.runId}`);
+    const retrySpan = startDiagnosticSpan("openclaw.context.compact.retry", {
+      run_id: ctx.params.runId,
+      completed: hasResult && !wasAborted,
+      aborted: wasAborted,
+      ...(ctx.params.sessionKey ? { session_key: ctx.params.sessionKey } : {}),
+    });
+    try {
+      ctx.noteCompactionRetry();
+      ctx.resetForCompactionRetry();
+      endDiagnosticSpan(retrySpan, {
+        status: "ok",
+        attributes: {
+          run_id: ctx.params.runId,
+          completed: hasResult && !wasAborted,
+          aborted: wasAborted,
+        },
+      });
+      ctx.log.debug(`embedded run compaction retry: runId=${ctx.params.runId}`);
+    } catch (err) {
+      endDiagnosticSpan(retrySpan, {
+        status: "error",
+        error: err instanceof Error ? (err.stack ?? err.message) : String(err),
+      });
+      throw err;
+    }
   } else {
     ctx.maybeResolveCompactionWait();
     clearStaleAssistantUsageOnSessionMessages(ctx);

@@ -33,6 +33,7 @@ import { emitAgentEvent, registerAgentRunContext } from "../../infra/agent-event
 import {
   endDiagnosticSpan,
   startDiagnosticSpan,
+  type DiagnosticSpanHandle,
   updateCurrentDiagnosticTraceMetadata,
   withDiagnosticSpan,
 } from "../../infra/diagnostic-trace.js";
@@ -86,6 +87,98 @@ export type AgentRunLoopResult =
       directlySentBlockKeys?: Set<string>;
     }
   | { kind: "final"; payload: ReplyPayload };
+
+type StreamSpanKind = "reasoning" | "assistant" | "tool_call";
+
+type StreamSpanState = {
+  handle: DiagnosticSpanHandle | null;
+  chunkCount: number;
+  charCount: number;
+  startedAt: number;
+};
+
+function streamSpanName(kind: StreamSpanKind): string {
+  switch (kind) {
+    case "reasoning":
+      return "openclaw.model.stream.reasoning";
+    case "assistant":
+      return "openclaw.model.stream.assistant";
+    case "tool_call":
+      return "openclaw.model.stream.tool_call";
+  }
+}
+
+function createModelStreamSpanTracker(baseAttributes: Record<string, string | number | boolean>) {
+  const spans = new Map<StreamSpanKind, StreamSpanState>();
+  const start = (
+    kind: StreamSpanKind,
+    attributes?: Record<string, string | number | boolean>,
+  ): StreamSpanState => {
+    const existing = spans.get(kind);
+    if (existing) {
+      return existing;
+    }
+    const state: StreamSpanState = {
+      handle: startDiagnosticSpan(streamSpanName(kind), {
+        ...baseAttributes,
+        stream_kind: kind,
+        ...attributes,
+      }),
+      chunkCount: 0,
+      charCount: 0,
+      startedAt: Date.now(),
+    };
+    spans.set(kind, state);
+    return state;
+  };
+  const finish = (
+    kind: StreamSpanKind,
+    options?: {
+      status?: "ok" | "error";
+      error?: string;
+      attributes?: Record<string, string | number | boolean>;
+    },
+  ) => {
+    const state = spans.get(kind);
+    if (!state) {
+      return;
+    }
+    spans.delete(kind);
+    endDiagnosticSpan(state.handle, {
+      status: options?.status ?? "ok",
+      ...(options?.error ? { error: options.error } : {}),
+      attributes: {
+        ...baseAttributes,
+        stream_kind: kind,
+        chunk_count: state.chunkCount,
+        char_count: state.charCount,
+        duration_ms: Date.now() - state.startedAt,
+        ...options?.attributes,
+      },
+    });
+  };
+  return {
+    record(
+      kind: StreamSpanKind,
+      text?: string,
+      attributes?: Record<string, string | number | boolean>,
+    ) {
+      const state = start(kind, attributes);
+      state.chunkCount += 1;
+      state.charCount += typeof text === "string" ? text.length : 0;
+    },
+    finish,
+    finishAll(options?: { status?: "ok" | "error"; error?: string }) {
+      while (spans.size > 0) {
+        const next = spans.keys().next();
+        if (next.done) {
+          break;
+        }
+        finish(next.value, options);
+      }
+    },
+  };
+}
 
 /**
  * Build a human-friendly rate-limit message from a FallbackSummaryError.
@@ -287,402 +380,613 @@ export async function runAgentTurnWithFallback(params: {
               })
             : undefined;
           const onToolResult = params.opts?.onToolResult;
-          const fallbackResult = await runWithModelFallback({
-            ...resolveModelFallbackOptions(params.followupRun.run),
-            runId,
-            run: async (provider, model, runOptions) => {
-              attemptOrdinal += 1;
-              logRunAttempt({
-                sessionKey: params.sessionKey,
-                sessionId: params.followupRun.run.sessionId,
+          const fallbackResult = await withDiagnosticSpan(
+            "openclaw.agent.loop",
+            {
+              run_id: runId,
+              heartbeat: params.isHeartbeat,
+              ...(params.sessionKey ? { session_key: params.sessionKey } : {}),
+            },
+            async () =>
+              await runWithModelFallback({
+                ...resolveModelFallbackOptions(params.followupRun.run),
                 runId,
-                attempt: attemptOrdinal,
-              });
-              // Notify that model selection is complete (including after fallback).
-              // This allows responsePrefix template interpolation with the actual model.
-              params.opts?.onModelSelected?.({
-                provider,
-                model,
-                thinkLevel: params.followupRun.run.thinkLevel,
-              });
-              updateCurrentDiagnosticTraceMetadata({ provider, model });
-
-              return await withDiagnosticSpan(
-                "openclaw.model.attempt",
-                {
-                  attempt: attemptOrdinal,
-                  provider,
-                  model,
-                  ...(params.sessionKey ? { session_key: params.sessionKey } : {}),
-                },
-                async () => {
-                  const firstTokenSpan = startDiagnosticSpan("openclaw.model.first_token_wait", {
+                run: async (provider, model, runOptions) => {
+                  attemptOrdinal += 1;
+                  logRunAttempt({
+                    sessionKey: params.sessionKey,
+                    sessionId: params.followupRun.run.sessionId,
+                    runId,
                     attempt: attemptOrdinal,
+                  });
+                  // Notify that model selection is complete (including after fallback).
+                  // This allows responsePrefix template interpolation with the actual model.
+                  params.opts?.onModelSelected?.({
                     provider,
                     model,
-                    ...(params.sessionKey ? { session_key: params.sessionKey } : {}),
+                    thinkLevel: params.followupRun.run.thinkLevel,
                   });
-                  let firstTokenResolved = false;
-                  const resolveFirstToken = (
-                    attributes?: Record<string, string | number | boolean>,
-                  ) => {
-                    if (firstTokenResolved) {
-                      return;
-                    }
-                    firstTokenResolved = true;
-                    endDiagnosticSpan(firstTokenSpan, {
-                      status: "ok",
-                      ...(attributes ? { attributes } : {}),
-                    });
-                  };
-                  const failFirstToken = (error: unknown) => {
-                    if (firstTokenResolved) {
-                      return;
-                    }
-                    firstTokenResolved = true;
-                    endDiagnosticSpan(firstTokenSpan, {
-                      status: "error",
-                      error:
-                        error instanceof Error ? (error.stack ?? error.message) : String(error),
-                    });
-                  };
+                  updateCurrentDiagnosticTraceMetadata({ provider, model });
 
-                  try {
-                    if (isCliProvider(provider, params.followupRun.run.config)) {
-                      const startedAt = Date.now();
-                      notifyAgentRunStart();
-                      emitAgentEvent({
-                        runId,
-                        stream: "lifecycle",
-                        data: {
-                          phase: "start",
-                          startedAt,
+                  return await withDiagnosticSpan(
+                    "openclaw.agent.iteration",
+                    {
+                      attempt: attemptOrdinal,
+                      iteration: attemptOrdinal,
+                      provider,
+                      model,
+                      ...(params.sessionKey ? { session_key: params.sessionKey } : {}),
+                    },
+                    async () =>
+                      await withDiagnosticSpan(
+                        "openclaw.model.attempt",
+                        {
+                          attempt: attemptOrdinal,
+                          provider,
+                          model,
+                          ...(params.sessionKey ? { session_key: params.sessionKey } : {}),
                         },
-                      });
-                      const cliSessionBinding = getCliSessionBinding(
-                        params.getActiveSessionEntry(),
-                        provider,
-                      );
-                      const authProfileId =
-                        provider === params.followupRun.run.provider
-                          ? params.followupRun.run.authProfileId
-                          : undefined;
-                      return await (async () => {
-                        let lifecycleTerminalEmitted = false;
-                        try {
-                          const result = await runCliAgent({
-                            sessionId: params.followupRun.run.sessionId,
-                            sessionKey: params.sessionKey,
-                            agentId: params.followupRun.run.agentId,
-                            sessionFile: params.followupRun.run.sessionFile,
-                            workspaceDir: params.followupRun.run.workspaceDir,
-                            config: params.followupRun.run.config,
-                            prompt: params.commandBody,
-                            provider,
-                            model,
-                            thinkLevel: params.followupRun.run.thinkLevel,
-                            timeoutMs: params.followupRun.run.timeoutMs,
-                            runId,
-                            extraSystemPrompt: params.followupRun.run.extraSystemPrompt,
-                            ownerNumbers: params.followupRun.run.ownerNumbers,
-                            cliSessionId: cliSessionBinding?.sessionId,
-                            cliSessionBinding,
-                            authProfileId,
-                            bootstrapPromptWarningSignaturesSeen,
-                            bootstrapPromptWarningSignature:
-                              bootstrapPromptWarningSignaturesSeen[
-                                bootstrapPromptWarningSignaturesSeen.length - 1
-                              ],
-                            images: params.opts?.images,
-                          });
-                          bootstrapPromptWarningSignaturesSeen =
-                            resolveBootstrapWarningSignaturesSeen(result.meta?.systemPromptReport);
-
-                          resolveFirstToken({ source: "cli_result" });
-                          await withDiagnosticSpan(
-                            "openclaw.model.complete",
+                        async () => {
+                          const firstTokenSpan = startDiagnosticSpan(
+                            "openclaw.model.first_token_wait",
                             {
                               attempt: attemptOrdinal,
                               provider,
                               model,
-                              source: "cli_result",
                               ...(params.sessionKey ? { session_key: params.sessionKey } : {}),
                             },
-                            async () => {},
                           );
-
-                          const cliText = result.payloads?.[0]?.text?.trim();
-                          if (cliText) {
-                            emitAgentEvent({
-                              runId,
-                              stream: "assistant",
-                              data: { text: cliText },
-                            });
-                          }
-
-                          emitAgentEvent({
-                            runId,
-                            stream: "lifecycle",
-                            data: {
-                              phase: "end",
-                              startedAt,
-                              endedAt: Date.now(),
-                            },
-                          });
-                          lifecycleTerminalEmitted = true;
-
-                          return result;
-                        } catch (err) {
-                          failFirstToken(err);
-                          emitAgentEvent({
-                            runId,
-                            stream: "lifecycle",
-                            data: {
-                              phase: "error",
-                              startedAt,
-                              endedAt: Date.now(),
-                              error: String(err),
-                            },
-                          });
-                          lifecycleTerminalEmitted = true;
-                          throw err;
-                        } finally {
-                          if (!lifecycleTerminalEmitted) {
-                            emitAgentEvent({
-                              runId,
-                              stream: "lifecycle",
-                              data: {
-                                phase: "error",
-                                startedAt,
-                                endedAt: Date.now(),
-                                error: "CLI run completed without lifecycle terminal event",
-                              },
-                            });
-                          }
-                        }
-                      })();
-                    }
-                    const { embeddedContext, senderContext, runBaseParams } =
-                      buildEmbeddedRunExecutionParams({
-                        run: params.followupRun.run,
-                        sessionCtx: params.sessionCtx,
-                        hasRepliedRef: params.opts?.hasRepliedRef,
-                        provider,
-                        runId,
-                        allowTransientCooldownProbe: runOptions?.allowTransientCooldownProbe,
-                        model,
-                      });
-                    return await (async () => {
-                      let attemptCompactionCount = 0;
-                      try {
-                        const result = await runEmbeddedPiAgent({
-                          ...embeddedContext,
-                          allowGatewaySubagentBinding: true,
-                          trigger: params.isHeartbeat ? "heartbeat" : "user",
-                          groupId: resolveGroupSessionKey(params.sessionCtx)?.id,
-                          groupChannel:
-                            params.sessionCtx.GroupChannel?.trim() ??
-                            params.sessionCtx.GroupSubject?.trim(),
-                          groupSpace: params.sessionCtx.GroupSpace?.trim() ?? undefined,
-                          ...senderContext,
-                          ...runBaseParams,
-                          prompt: params.commandBody,
-                          extraSystemPrompt: params.followupRun.run.extraSystemPrompt,
-                          toolResultFormat: (() => {
-                            const channel = resolveMessageChannel(
-                              params.sessionCtx.Surface,
-                              params.sessionCtx.Provider,
-                            );
-                            if (!channel) {
-                              return "markdown";
-                            }
-                            return isMarkdownCapableMessageChannel(channel) ? "markdown" : "plain";
-                          })(),
-                          suppressToolErrorWarnings: params.opts?.suppressToolErrorWarnings,
-                          bootstrapContextMode: params.opts?.bootstrapContextMode,
-                          bootstrapContextRunKind: params.opts?.isHeartbeat
-                            ? "heartbeat"
-                            : "default",
-                          images: params.opts?.images,
-                          abortSignal: params.opts?.abortSignal,
-                          blockReplyBreak: params.resolvedBlockStreamingBreak,
-                          blockReplyChunking: params.blockReplyChunking,
-                          onPartialReply: async (payload) => {
-                            resolveFirstToken({ source: "partial_reply" });
-                            const textForTyping = await handlePartialForTyping(payload);
-                            if (!params.opts?.onPartialReply || textForTyping === undefined) {
+                          let firstTokenResolved = false;
+                          const resolveFirstToken = (
+                            attributes?: Record<string, string | number | boolean>,
+                          ) => {
+                            if (firstTokenResolved) {
                               return;
                             }
-                            await params.opts.onPartialReply({
-                              text: textForTyping,
-                              mediaUrls: payload.mediaUrls,
+                            firstTokenResolved = true;
+                            endDiagnosticSpan(firstTokenSpan, {
+                              status: "ok",
+                              ...(attributes ? { attributes } : {}),
                             });
-                          },
-                          onAssistantMessageStart: async () => {
-                            resolveFirstToken({ source: "assistant_message_start" });
-                            await params.typingSignals.signalMessageStart();
-                            await params.opts?.onAssistantMessageStart?.();
-                          },
-                          onReasoningStream:
-                            params.typingSignals.shouldStartOnReasoning ||
-                            params.opts?.onReasoningStream
-                              ? async (payload) => {
-                                  resolveFirstToken({ source: "reasoning_stream" });
-                                  await params.typingSignals.signalReasoningDelta();
-                                  await params.opts?.onReasoningStream?.({
-                                    text: payload.text,
-                                    mediaUrls: payload.mediaUrls,
-                                  });
-                                }
-                              : undefined,
-                          onReasoningEnd: params.opts?.onReasoningEnd,
-                          onAgentEvent: async (evt) => {
-                            resolveFirstToken({ source: `agent_event:${evt.stream}` });
-                            // Signal run start only after the embedded agent emits real activity.
-                            const hasLifecyclePhase =
-                              evt.stream === "lifecycle" && typeof evt.data.phase === "string";
-                            if (evt.stream !== "lifecycle" || hasLifecyclePhase) {
-                              notifyAgentRunStart();
+                          };
+                          const failFirstToken = (error: unknown) => {
+                            if (firstTokenResolved) {
+                              return;
                             }
-                            // Trigger typing when tools start executing.
-                            // Must await to ensure typing indicator starts before tool summaries are emitted.
-                            if (evt.stream === "tool") {
-                              const phase =
-                                typeof evt.data.phase === "string" ? evt.data.phase : "";
-                              const name =
-                                typeof evt.data.name === "string" ? evt.data.name : undefined;
-                              if (phase === "start" || phase === "update") {
-                                await params.typingSignals.signalToolStart();
-                                await params.opts?.onToolStart?.({ name, phase });
-                              }
-                            }
-                            // Track auto-compaction and notify higher layers.
-                            if (evt.stream === "compaction") {
-                              const phase =
-                                typeof evt.data.phase === "string" ? evt.data.phase : "";
-                              if (phase === "start") {
-                                if (params.opts?.onCompactionStart) {
-                                  await params.opts.onCompactionStart();
-                                } else if (params.opts?.onBlockReply) {
-                                  // Send directly via opts.onBlockReply (bypassing the
-                                  // pipeline) so the notice does not cause final payloads
-                                  // to be discarded on non-streaming model paths.
-                                  const currentMessageId =
-                                    params.sessionCtx.MessageSidFull ??
-                                    params.sessionCtx.MessageSid;
-                                  const noticePayload = params.applyReplyToMode({
-                                    text: "🧹 Compacting context...",
-                                    replyToId: currentMessageId,
-                                    replyToCurrent: true,
-                                    isCompactionNotice: true,
-                                  });
-                                  try {
-                                    await params.opts.onBlockReply(noticePayload);
-                                  } catch (err) {
-                                    // Non-critical notice delivery failure should not
-                                    // bubble out of the fire-and-forget event handler.
-                                    logVerbose(
-                                      `compaction start notice delivery failed (non-fatal): ${String(err)}`,
-                                    );
-                                  }
-                                }
-                              }
-                              const completed = evt.data?.completed === true;
-                              if (phase === "end" && completed) {
-                                attemptCompactionCount += 1;
-                                await params.opts?.onCompactionEnd?.();
-                              }
-                            }
-                          },
-                          // Always pass onBlockReply so flushBlockReplyBuffer works before tool execution,
-                          // even when regular block streaming is disabled. The handler sends directly
-                          // via opts.onBlockReply when the pipeline isn't available.
-                          onBlockReply: blockReplyHandler,
-                          onBlockReplyFlush:
-                            params.blockStreamingEnabled && blockReplyPipeline
-                              ? async () => {
-                                  await blockReplyPipeline.flush({ force: true });
-                                }
-                              : undefined,
-                          shouldEmitToolResult: params.shouldEmitToolResult,
-                          shouldEmitToolOutput: params.shouldEmitToolOutput,
-                          bootstrapPromptWarningSignaturesSeen,
-                          bootstrapPromptWarningSignature:
-                            bootstrapPromptWarningSignaturesSeen[
-                              bootstrapPromptWarningSignaturesSeen.length - 1
-                            ],
-                          onToolResult: onToolResult
-                            ? (() => {
-                                // Serialize tool result delivery to preserve message ordering.
-                                // Without this, concurrent tool callbacks race through typing signals
-                                // and message sends, causing out-of-order delivery to the user.
-                                // See: https://github.com/openclaw/openclaw/issues/11044
-                                let toolResultChain: Promise<void> = Promise.resolve();
-                                return (payload: ReplyPayload) => {
-                                  toolResultChain = toolResultChain
-                                    .then(async () => {
-                                      const { text, skip } = normalizeStreamingText(payload);
-                                      if (skip) {
-                                        return;
-                                      }
-                                      if (text !== undefined) {
-                                        await params.typingSignals.signalTextDelta(text);
-                                      }
-                                      await onToolResult({
-                                        ...payload,
-                                        text,
-                                      });
-                                    })
-                                    .catch((err) => {
-                                      // Keep chain healthy after an error so later tool results still deliver.
-                                      logVerbose(`tool result delivery failed: ${String(err)}`);
-                                    });
-                                  const task = toolResultChain.finally(() => {
-                                    params.pendingToolTasks.delete(task);
-                                  });
-                                  params.pendingToolTasks.add(task);
-                                };
-                              })()
-                            : undefined,
-                        });
-                        resolveFirstToken({ source: "run_complete" });
-                        await withDiagnosticSpan(
-                          "openclaw.model.complete",
-                          {
+                            firstTokenResolved = true;
+                            endDiagnosticSpan(firstTokenSpan, {
+                              status: "error",
+                              error:
+                                error instanceof Error
+                                  ? (error.stack ?? error.message)
+                                  : String(error),
+                            });
+                          };
+                          const streamTracker = createModelStreamSpanTracker({
                             attempt: attemptOrdinal,
                             provider,
                             model,
-                            source: "run_complete",
+                            run_id: runId,
                             ...(params.sessionKey ? { session_key: params.sessionKey } : {}),
-                          },
-                          async () => {},
-                        );
-                        bootstrapPromptWarningSignaturesSeen =
-                          resolveBootstrapWarningSignaturesSeen(result.meta?.systemPromptReport);
-                        const resultCompactionCount = Math.max(
-                          0,
-                          result.meta?.agentMeta?.compactionCount ?? 0,
-                        );
-                        attemptCompactionCount = Math.max(
-                          attemptCompactionCount,
-                          resultCompactionCount,
-                        );
-                        return result;
-                      } catch (err) {
-                        failFirstToken(err);
-                        throw err;
-                      } finally {
-                        autoCompactionCount += attemptCompactionCount;
-                      }
-                    })();
-                  } catch (err) {
-                    failFirstToken(err);
-                    throw err;
-                  }
+                          });
+
+                          try {
+                            if (isCliProvider(provider, params.followupRun.run.config)) {
+                              const startedAt = Date.now();
+                              notifyAgentRunStart();
+                              emitAgentEvent({
+                                runId,
+                                stream: "lifecycle",
+                                data: {
+                                  phase: "start",
+                                  startedAt,
+                                },
+                              });
+                              const { cliSessionBinding, authProfileId } = await withDiagnosticSpan(
+                                "openclaw.model.request.prepare",
+                                {
+                                  attempt: attemptOrdinal,
+                                  provider,
+                                  model,
+                                  runtime: "cli",
+                                  ...(params.sessionKey ? { session_key: params.sessionKey } : {}),
+                                },
+                                async () => ({
+                                  cliSessionBinding: getCliSessionBinding(
+                                    params.getActiveSessionEntry(),
+                                    provider,
+                                  ),
+                                  authProfileId:
+                                    provider === params.followupRun.run.provider
+                                      ? params.followupRun.run.authProfileId
+                                      : undefined,
+                                }),
+                              );
+                              return await (async () => {
+                                let lifecycleTerminalEmitted = false;
+                                try {
+                                  const result = await withDiagnosticSpan(
+                                    "openclaw.model.round_trip",
+                                    {
+                                      attempt: attemptOrdinal,
+                                      provider,
+                                      model,
+                                      runtime: "cli",
+                                      ...(params.sessionKey
+                                        ? { session_key: params.sessionKey }
+                                        : {}),
+                                    },
+                                    async () =>
+                                      await runCliAgent({
+                                        sessionId: params.followupRun.run.sessionId,
+                                        sessionKey: params.sessionKey,
+                                        agentId: params.followupRun.run.agentId,
+                                        sessionFile: params.followupRun.run.sessionFile,
+                                        workspaceDir: params.followupRun.run.workspaceDir,
+                                        config: params.followupRun.run.config,
+                                        prompt: params.commandBody,
+                                        provider,
+                                        model,
+                                        thinkLevel: params.followupRun.run.thinkLevel,
+                                        timeoutMs: params.followupRun.run.timeoutMs,
+                                        runId,
+                                        extraSystemPrompt: params.followupRun.run.extraSystemPrompt,
+                                        ownerNumbers: params.followupRun.run.ownerNumbers,
+                                        cliSessionId: cliSessionBinding?.sessionId,
+                                        cliSessionBinding,
+                                        authProfileId,
+                                        bootstrapPromptWarningSignaturesSeen,
+                                        bootstrapPromptWarningSignature:
+                                          bootstrapPromptWarningSignaturesSeen[
+                                            bootstrapPromptWarningSignaturesSeen.length - 1
+                                          ],
+                                        images: params.opts?.images,
+                                      }),
+                                  );
+                                  await withDiagnosticSpan(
+                                    "openclaw.model.response.parse",
+                                    {
+                                      attempt: attemptOrdinal,
+                                      provider,
+                                      model,
+                                      runtime: "cli",
+                                      ...(params.sessionKey
+                                        ? { session_key: params.sessionKey }
+                                        : {}),
+                                    },
+                                    async () => {
+                                      bootstrapPromptWarningSignaturesSeen =
+                                        resolveBootstrapWarningSignaturesSeen(
+                                          result.meta?.systemPromptReport,
+                                        );
+                                    },
+                                  );
+
+                                  resolveFirstToken({ source: "cli_result" });
+                                  await withDiagnosticSpan(
+                                    "openclaw.model.complete",
+                                    {
+                                      attempt: attemptOrdinal,
+                                      provider,
+                                      model,
+                                      source: "cli_result",
+                                      ...(params.sessionKey
+                                        ? { session_key: params.sessionKey }
+                                        : {}),
+                                    },
+                                    async () => {},
+                                  );
+                                  const cliText = result.payloads?.[0]?.text?.trim();
+                                  if (cliText) {
+                                    streamTracker.record("assistant", cliText, {
+                                      source: "cli_result",
+                                    });
+                                    streamTracker.finish("assistant", {
+                                      attributes: { source: "cli_result" },
+                                    });
+                                    emitAgentEvent({
+                                      runId,
+                                      stream: "assistant",
+                                      data: { text: cliText },
+                                    });
+                                  }
+                                  streamTracker.finishAll({ status: "ok" });
+
+                                  emitAgentEvent({
+                                    runId,
+                                    stream: "lifecycle",
+                                    data: {
+                                      phase: "end",
+                                      startedAt,
+                                      endedAt: Date.now(),
+                                    },
+                                  });
+                                  lifecycleTerminalEmitted = true;
+
+                                  return result;
+                                } catch (err) {
+                                  failFirstToken(err);
+                                  streamTracker.finishAll({
+                                    status: "error",
+                                    error:
+                                      err instanceof Error
+                                        ? (err.stack ?? err.message)
+                                        : String(err),
+                                  });
+                                  emitAgentEvent({
+                                    runId,
+                                    stream: "lifecycle",
+                                    data: {
+                                      phase: "error",
+                                      startedAt,
+                                      endedAt: Date.now(),
+                                      error: String(err),
+                                    },
+                                  });
+                                  lifecycleTerminalEmitted = true;
+                                  throw err;
+                                } finally {
+                                  if (!lifecycleTerminalEmitted) {
+                                    emitAgentEvent({
+                                      runId,
+                                      stream: "lifecycle",
+                                      data: {
+                                        phase: "error",
+                                        startedAt,
+                                        endedAt: Date.now(),
+                                        error: "CLI run completed without lifecycle terminal event",
+                                      },
+                                    });
+                                  }
+                                }
+                              })();
+                            }
+                            const { embeddedContext, senderContext, runBaseParams } =
+                              await withDiagnosticSpan(
+                                "openclaw.model.request.prepare",
+                                {
+                                  attempt: attemptOrdinal,
+                                  provider,
+                                  model,
+                                  runtime: "embedded",
+                                  ...(params.sessionKey ? { session_key: params.sessionKey } : {}),
+                                },
+                                async () =>
+                                  buildEmbeddedRunExecutionParams({
+                                    run: params.followupRun.run,
+                                    sessionCtx: params.sessionCtx,
+                                    hasRepliedRef: params.opts?.hasRepliedRef,
+                                    provider,
+                                    runId,
+                                    allowTransientCooldownProbe:
+                                      runOptions?.allowTransientCooldownProbe,
+                                    model,
+                                  }),
+                              );
+                            return await (async () => {
+                              let attemptCompactionCount = 0;
+                              try {
+                                const result = await withDiagnosticSpan(
+                                  "openclaw.model.round_trip",
+                                  {
+                                    attempt: attemptOrdinal,
+                                    provider,
+                                    model,
+                                    runtime: "embedded",
+                                    ...(params.sessionKey
+                                      ? { session_key: params.sessionKey }
+                                      : {}),
+                                  },
+                                  async () =>
+                                    await runEmbeddedPiAgent({
+                                      ...embeddedContext,
+                                      allowGatewaySubagentBinding: true,
+                                      trigger: params.isHeartbeat ? "heartbeat" : "user",
+                                      groupId: resolveGroupSessionKey(params.sessionCtx)?.id,
+                                      groupChannel:
+                                        params.sessionCtx.GroupChannel?.trim() ??
+                                        params.sessionCtx.GroupSubject?.trim(),
+                                      groupSpace: params.sessionCtx.GroupSpace?.trim() ?? undefined,
+                                      ...senderContext,
+                                      ...runBaseParams,
+                                      prompt: params.commandBody,
+                                      extraSystemPrompt: params.followupRun.run.extraSystemPrompt,
+                                      toolResultFormat: (() => {
+                                        const channel = resolveMessageChannel(
+                                          params.sessionCtx.Surface,
+                                          params.sessionCtx.Provider,
+                                        );
+                                        if (!channel) {
+                                          return "markdown";
+                                        }
+                                        return isMarkdownCapableMessageChannel(channel)
+                                          ? "markdown"
+                                          : "plain";
+                                      })(),
+                                      suppressToolErrorWarnings:
+                                        params.opts?.suppressToolErrorWarnings,
+                                      bootstrapContextMode: params.opts?.bootstrapContextMode,
+                                      bootstrapContextRunKind: params.opts?.isHeartbeat
+                                        ? "heartbeat"
+                                        : "default",
+                                      images: params.opts?.images,
+                                      abortSignal: params.opts?.abortSignal,
+                                      blockReplyBreak: params.resolvedBlockStreamingBreak,
+                                      blockReplyChunking: params.blockReplyChunking,
+                                      onPartialReply: async (payload) => {
+                                        resolveFirstToken({ source: "partial_reply" });
+                                        streamTracker.record("assistant", payload.text, {
+                                          source: "partial_reply",
+                                        });
+                                        const textForTyping = await handlePartialForTyping(payload);
+                                        if (
+                                          !params.opts?.onPartialReply ||
+                                          textForTyping === undefined
+                                        ) {
+                                          return;
+                                        }
+                                        await params.opts.onPartialReply({
+                                          text: textForTyping,
+                                          mediaUrls: payload.mediaUrls,
+                                        });
+                                      },
+                                      onAssistantMessageStart: async () => {
+                                        resolveFirstToken({ source: "assistant_message_start" });
+                                        streamTracker.record("assistant", undefined, {
+                                          source: "assistant_message_start",
+                                        });
+                                        await params.typingSignals.signalMessageStart();
+                                        await params.opts?.onAssistantMessageStart?.();
+                                      },
+                                      onReasoningStream:
+                                        params.typingSignals.shouldStartOnReasoning ||
+                                        params.opts?.onReasoningStream
+                                          ? async (payload) => {
+                                              resolveFirstToken({ source: "reasoning_stream" });
+                                              streamTracker.record("reasoning", payload.text, {
+                                                source: "reasoning_stream",
+                                              });
+                                              await params.typingSignals.signalReasoningDelta();
+                                              await params.opts?.onReasoningStream?.({
+                                                text: payload.text,
+                                                mediaUrls: payload.mediaUrls,
+                                              });
+                                            }
+                                          : undefined,
+                                      onReasoningEnd: async () => {
+                                        streamTracker.finish("reasoning", {
+                                          attributes: { source: "reasoning_end" },
+                                        });
+                                        await params.opts?.onReasoningEnd?.();
+                                      },
+                                      onAgentEvent: async (evt) => {
+                                        resolveFirstToken({ source: `agent_event:${evt.stream}` });
+                                        // Signal run start only after the embedded agent emits real activity.
+                                        const hasLifecyclePhase =
+                                          evt.stream === "lifecycle" &&
+                                          typeof evt.data.phase === "string";
+                                        if (evt.stream !== "lifecycle" || hasLifecyclePhase) {
+                                          notifyAgentRunStart();
+                                        }
+                                        // Trigger typing when tools start executing.
+                                        // Must await to ensure typing indicator starts before tool summaries are emitted.
+                                        if (evt.stream === "tool") {
+                                          const phase =
+                                            typeof evt.data.phase === "string"
+                                              ? evt.data.phase
+                                              : "";
+                                          const name =
+                                            typeof evt.data.name === "string"
+                                              ? evt.data.name
+                                              : undefined;
+                                          if (phase === "start") {
+                                            streamTracker.finish("assistant", {
+                                              attributes: { source: "tool_start" },
+                                            });
+                                            streamTracker.finish("reasoning", {
+                                              attributes: { source: "tool_start" },
+                                            });
+                                            streamTracker.record("tool_call", undefined, {
+                                              source: "agent_event",
+                                              phase,
+                                              ...(name ? { tool_name: name } : {}),
+                                            });
+                                            streamTracker.finish("tool_call", {
+                                              attributes: {
+                                                source: "agent_event",
+                                                phase,
+                                                ...(name ? { tool_name: name } : {}),
+                                              },
+                                            });
+                                          }
+                                          if (phase === "start" || phase === "update") {
+                                            await params.typingSignals.signalToolStart();
+                                            await params.opts?.onToolStart?.({ name, phase });
+                                          }
+                                        }
+                                        // Track auto-compaction and notify higher layers.
+                                        if (evt.stream === "compaction") {
+                                          const phase =
+                                            typeof evt.data.phase === "string"
+                                              ? evt.data.phase
+                                              : "";
+                                          if (phase === "start") {
+                                            if (params.opts?.onCompactionStart) {
+                                              await params.opts.onCompactionStart();
+                                            } else if (params.opts?.onBlockReply) {
+                                              // Send directly via opts.onBlockReply (bypassing the
+                                              // pipeline) so the notice does not cause final payloads
+                                              // to be discarded on non-streaming model paths.
+                                              const currentMessageId =
+                                                params.sessionCtx.MessageSidFull ??
+                                                params.sessionCtx.MessageSid;
+                                              const noticePayload = params.applyReplyToMode({
+                                                text: "🧹 Compacting context...",
+                                                replyToId: currentMessageId,
+                                                replyToCurrent: true,
+                                                isCompactionNotice: true,
+                                              });
+                                              try {
+                                                await params.opts.onBlockReply(noticePayload);
+                                              } catch (err) {
+                                                // Non-critical notice delivery failure should not
+                                                // bubble out of the fire-and-forget event handler.
+                                                logVerbose(
+                                                  `compaction start notice delivery failed (non-fatal): ${String(err)}`,
+                                                );
+                                              }
+                                            }
+                                          }
+                                          const completed = evt.data?.completed === true;
+                                          if (phase === "end" && completed) {
+                                            attemptCompactionCount += 1;
+                                            await params.opts?.onCompactionEnd?.();
+                                          }
+                                        }
+                                      },
+                                      // Always pass onBlockReply so flushBlockReplyBuffer works before tool execution,
+                                      // even when regular block streaming is disabled. The handler sends directly
+                                      // via opts.onBlockReply when the pipeline isn't available.
+                                      onBlockReply: blockReplyHandler,
+                                      onBlockReplyFlush:
+                                        params.blockStreamingEnabled && blockReplyPipeline
+                                          ? async () => {
+                                              await blockReplyPipeline.flush({ force: true });
+                                            }
+                                          : undefined,
+                                      shouldEmitToolResult: params.shouldEmitToolResult,
+                                      shouldEmitToolOutput: params.shouldEmitToolOutput,
+                                      bootstrapPromptWarningSignaturesSeen,
+                                      bootstrapPromptWarningSignature:
+                                        bootstrapPromptWarningSignaturesSeen[
+                                          bootstrapPromptWarningSignaturesSeen.length - 1
+                                        ],
+                                      onToolResult: onToolResult
+                                        ? (() => {
+                                            // Serialize tool result delivery to preserve message ordering.
+                                            // Without this, concurrent tool callbacks race through typing signals
+                                            // and message sends, causing out-of-order delivery to the user.
+                                            // See: https://github.com/openclaw/openclaw/issues/11044
+                                            let toolResultChain: Promise<void> = Promise.resolve();
+                                            return (payload: ReplyPayload) => {
+                                              toolResultChain = toolResultChain
+                                                .then(async () => {
+                                                  const { text, skip } =
+                                                    normalizeStreamingText(payload);
+                                                  if (skip) {
+                                                    return;
+                                                  }
+                                                  if (text !== undefined) {
+                                                    await params.typingSignals.signalTextDelta(
+                                                      text,
+                                                    );
+                                                  }
+                                                  await onToolResult({
+                                                    ...payload,
+                                                    text,
+                                                  });
+                                                })
+                                                .catch((err) => {
+                                                  // Keep chain healthy after an error so later tool results still deliver.
+                                                  logVerbose(
+                                                    `tool result delivery failed: ${String(err)}`,
+                                                  );
+                                                });
+                                              const task = toolResultChain.finally(() => {
+                                                params.pendingToolTasks.delete(task);
+                                              });
+                                              params.pendingToolTasks.add(task);
+                                            };
+                                          })()
+                                        : undefined,
+                                    }),
+                                );
+                                resolveFirstToken({ source: "run_complete" });
+                                await withDiagnosticSpan(
+                                  "openclaw.model.complete",
+                                  {
+                                    attempt: attemptOrdinal,
+                                    provider,
+                                    model,
+                                    source: "run_complete",
+                                    ...(params.sessionKey
+                                      ? { session_key: params.sessionKey }
+                                      : {}),
+                                  },
+                                  async () => {},
+                                );
+                                await withDiagnosticSpan(
+                                  "openclaw.model.response.parse",
+                                  {
+                                    attempt: attemptOrdinal,
+                                    provider,
+                                    model,
+                                    runtime: "embedded",
+                                    ...(params.sessionKey
+                                      ? { session_key: params.sessionKey }
+                                      : {}),
+                                  },
+                                  async () => {
+                                    bootstrapPromptWarningSignaturesSeen =
+                                      resolveBootstrapWarningSignaturesSeen(
+                                        result.meta?.systemPromptReport,
+                                      );
+                                    const resultCompactionCount = Math.max(
+                                      0,
+                                      result.meta?.agentMeta?.compactionCount ?? 0,
+                                    );
+                                    attemptCompactionCount = Math.max(
+                                      attemptCompactionCount,
+                                      resultCompactionCount,
+                                    );
+                                  },
+                                );
+                                streamTracker.finishAll({ status: "ok" });
+                                return result;
+                              } catch (err) {
+                                failFirstToken(err);
+                                streamTracker.finishAll({
+                                  status: "error",
+                                  error:
+                                    err instanceof Error ? (err.stack ?? err.message) : String(err),
+                                });
+                                throw err;
+                              } finally {
+                                autoCompactionCount += attemptCompactionCount;
+                              }
+                            })();
+                          } catch (err) {
+                            failFirstToken(err);
+                            throw err;
+                          }
+                        },
+                      ),
+                  );
                 },
-              );
-            },
-          });
+              }),
+          );
+          if (
+            fallbackResult.provider !== params.followupRun.run.provider ||
+            fallbackResult.model !== params.followupRun.run.model ||
+            (Array.isArray(fallbackResult.attempts) && fallbackResult.attempts.length > 1)
+          ) {
+            await withDiagnosticSpan(
+              "openclaw.model.fallback.select",
+              {
+                reason: "model_fallback_result",
+                from_provider: params.followupRun.run.provider,
+                from_model: params.followupRun.run.model,
+                to_provider: fallbackResult.provider,
+                to_model: fallbackResult.model,
+                attempts: Array.isArray(fallbackResult.attempts)
+                  ? fallbackResult.attempts.length
+                  : 0,
+                run_id: runId,
+                ...(params.sessionKey ? { session_key: params.sessionKey } : {}),
+              },
+              async () => {},
+            );
+          }
           runResult = fallbackResult.result;
           fallbackProvider = fallbackResult.provider;
           fallbackModel = fallbackResult.model;
@@ -704,7 +1008,15 @@ export async function runAgentTurnWithFallback(params: {
             embeddedError &&
             isContextOverflowError(embeddedError.message) &&
             !didResetAfterCompactionFailure &&
-            (await params.resetSessionAfterCompactionFailure(embeddedError.message))
+            (await withDiagnosticSpan(
+              "openclaw.session.reset",
+              {
+                reason: "embedded_context_overflow",
+                run_id: runId,
+                ...(params.sessionKey ? { session_key: params.sessionKey } : {}),
+              },
+              async () => await params.resetSessionAfterCompactionFailure(embeddedError.message),
+            ))
           ) {
             didResetAfterCompactionFailure = true;
             return {
@@ -715,8 +1027,14 @@ export async function runAgentTurnWithFallback(params: {
             };
           }
           if (embeddedError?.kind === "role_ordering") {
-            const didReset = await params.resetSessionAfterRoleOrderingConflict(
-              embeddedError.message,
+            const didReset = await withDiagnosticSpan(
+              "openclaw.session.reset",
+              {
+                reason: "embedded_role_ordering",
+                run_id: runId,
+                ...(params.sessionKey ? { session_key: params.sessionKey } : {}),
+              },
+              async () => await params.resetSessionAfterRoleOrderingConflict(embeddedError.message),
             );
             if (didReset) {
               return {
@@ -731,14 +1049,28 @@ export async function runAgentTurnWithFallback(params: {
           break;
         } catch (err) {
           if (err instanceof LiveSessionModelSwitchError) {
-            params.followupRun.run.provider = err.provider;
-            params.followupRun.run.model = err.model;
-            params.followupRun.run.authProfileId = err.authProfileId;
-            params.followupRun.run.authProfileIdSource = err.authProfileId
-              ? err.authProfileIdSource
-              : undefined;
-            fallbackProvider = err.provider;
-            fallbackModel = err.model;
+            await withDiagnosticSpan(
+              "openclaw.model.fallback.select",
+              {
+                reason: "live_session_model_switch",
+                from_provider: params.followupRun.run.provider,
+                from_model: params.followupRun.run.model,
+                to_provider: err.provider,
+                to_model: err.model,
+                run_id: runId,
+                ...(params.sessionKey ? { session_key: params.sessionKey } : {}),
+              },
+              async () => {
+                params.followupRun.run.provider = err.provider;
+                params.followupRun.run.model = err.model;
+                params.followupRun.run.authProfileId = err.authProfileId;
+                params.followupRun.run.authProfileIdSource = err.authProfileId
+                  ? err.authProfileIdSource
+                  : undefined;
+                fallbackProvider = err.provider;
+                fallbackModel = err.model;
+              },
+            );
             continue;
           }
           const message = err instanceof Error ? err.message : String(err);
@@ -754,7 +1086,15 @@ export async function runAgentTurnWithFallback(params: {
           if (
             isCompactionFailure &&
             !didResetAfterCompactionFailure &&
-            (await params.resetSessionAfterCompactionFailure(message))
+            (await withDiagnosticSpan(
+              "openclaw.session.reset",
+              {
+                reason: "compaction_failure",
+                run_id: runId,
+                ...(params.sessionKey ? { session_key: params.sessionKey } : {}),
+              },
+              async () => await params.resetSessionAfterCompactionFailure(message),
+            ))
           ) {
             didResetAfterCompactionFailure = true;
             return {
@@ -765,7 +1105,15 @@ export async function runAgentTurnWithFallback(params: {
             };
           }
           if (isRoleOrderingError) {
-            const didReset = await params.resetSessionAfterRoleOrderingConflict(message);
+            const didReset = await withDiagnosticSpan(
+              "openclaw.session.reset",
+              {
+                reason: "role_ordering_error",
+                run_id: runId,
+                ...(params.sessionKey ? { session_key: params.sessionKey } : {}),
+              },
+              async () => await params.resetSessionAfterRoleOrderingConflict(message),
+            );
             if (didReset) {
               return {
                 kind: "final",
@@ -784,29 +1132,41 @@ export async function runAgentTurnWithFallback(params: {
             params.storePath
           ) {
             const sessionKey = params.sessionKey;
+            const activeSessionStore = params.activeSessionStore;
+            const storePath = params.storePath;
             const corruptedSessionId = params.getActiveSessionEntry()?.sessionId;
             defaultRuntime.error(
               `Session history corrupted (Gemini function call ordering). Resetting session: ${params.sessionKey}`,
             );
 
             try {
-              // Delete transcript file if it exists
-              if (corruptedSessionId) {
-                const transcriptPath = resolveSessionTranscriptPath(corruptedSessionId);
-                try {
-                  fs.unlinkSync(transcriptPath);
-                } catch {
-                  // Ignore if file doesn't exist
-                }
-              }
+              await withDiagnosticSpan(
+                "openclaw.session.reset",
+                {
+                  reason: "session_corruption",
+                  run_id: runId,
+                  ...(params.sessionKey ? { session_key: params.sessionKey } : {}),
+                },
+                async () => {
+                  // Delete transcript file if it exists
+                  if (corruptedSessionId) {
+                    const transcriptPath = resolveSessionTranscriptPath(corruptedSessionId);
+                    try {
+                      fs.unlinkSync(transcriptPath);
+                    } catch {
+                      // Ignore if file doesn't exist
+                    }
+                  }
 
-              // Keep the in-memory snapshot consistent with the on-disk store reset.
-              delete params.activeSessionStore[sessionKey];
+                  // Keep the in-memory snapshot consistent with the on-disk store reset.
+                  delete activeSessionStore[sessionKey];
 
-              // Remove session entry from store using a fresh, locked snapshot.
-              await updateSessionStore(params.storePath, (store) => {
-                delete store[sessionKey];
-              });
+                  // Remove session entry from store using a fresh, locked snapshot.
+                  await updateSessionStore(storePath, (store) => {
+                    delete store[sessionKey];
+                  });
+                },
+              );
             } catch (cleanupErr) {
               defaultRuntime.error(
                 `Failed to reset corrupted session ${params.sessionKey}: ${String(cleanupErr)}`,
@@ -830,9 +1190,19 @@ export async function runAgentTurnWithFallback(params: {
             defaultRuntime.error(
               `Transient HTTP provider error before reply (${message}). Retrying once in ${TRANSIENT_HTTP_RETRY_DELAY_MS}ms.`,
             );
-            await new Promise<void>((resolve) => {
-              setTimeout(resolve, TRANSIENT_HTTP_RETRY_DELAY_MS);
-            });
+            await withDiagnosticSpan(
+              "openclaw.model.retry_delay",
+              {
+                reason: "transient_http",
+                delay_ms: TRANSIENT_HTTP_RETRY_DELAY_MS,
+                run_id: runId,
+                ...(params.sessionKey ? { session_key: params.sessionKey } : {}),
+              },
+              async () =>
+                await new Promise<void>((resolve) => {
+                  setTimeout(resolve, TRANSIENT_HTTP_RETRY_DELAY_MS);
+                }),
+            );
             continue;
           }
 
