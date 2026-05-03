@@ -280,6 +280,7 @@ export async function withDiagnosticSpan<T>(
   run: () => Promise<T>,
   options?: {
     startTimeMs?: number;
+    endAttributes?: () => Record<string, string | number | boolean> | undefined;
   },
 ): Promise<T> {
   const scope = getCurrentTraceScope();
@@ -298,7 +299,13 @@ export async function withDiagnosticSpan<T>(
     async () => {
       try {
         const result = await run();
-        endDiagnosticSpan(handle, { status: "ok" });
+        const endAttributes = options?.endAttributes?.();
+        endDiagnosticSpan(handle, {
+          status: "ok",
+          ...(endAttributes && Object.keys(endAttributes).length > 0
+            ? { attributes: endAttributes }
+            : {}),
+        });
         return result;
       } catch (error) {
         endDiagnosticSpan(handle, {

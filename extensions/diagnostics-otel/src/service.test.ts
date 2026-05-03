@@ -5,11 +5,23 @@ const registerLogTransportMock = vi.hoisted(() => vi.fn());
 const telemetryState = vi.hoisted(() => {
   const counters = new Map<string, { add: ReturnType<typeof vi.fn> }>();
   const histograms = new Map<string, { record: ReturnType<typeof vi.fn> }>();
+  const spans: Array<{
+    name: string;
+    end: ReturnType<typeof vi.fn>;
+    setStatus: ReturnType<typeof vi.fn>;
+    addEvent: ReturnType<typeof vi.fn>;
+  }> = [];
   const tracer = {
-    startSpan: vi.fn((_name: string, _opts?: unknown, _context?: unknown) => ({
-      end: vi.fn(),
-      setStatus: vi.fn(),
-    })),
+    startSpan: vi.fn((name: string, _opts?: unknown, _context?: unknown) => {
+      const span = {
+        name,
+        end: vi.fn(),
+        setStatus: vi.fn(),
+        addEvent: vi.fn(),
+      };
+      spans.push(span);
+      return span;
+    }),
   };
   const meter = {
     createCounter: vi.fn((name: string) => {
@@ -23,7 +35,7 @@ const telemetryState = vi.hoisted(() => {
       return histogram;
     }),
   };
-  return { counters, histograms, tracer, meter };
+  return { counters, histograms, spans, tracer, meter };
 });
 
 const sdkStart = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
@@ -185,6 +197,7 @@ describe("diagnostics-otel service", () => {
   beforeEach(() => {
     telemetryState.counters.clear();
     telemetryState.histograms.clear();
+    telemetryState.spans.length = 0;
     telemetryState.tracer.startSpan.mockClear();
     telemetryState.meter.createCounter.mockClear();
     telemetryState.meter.createHistogram.mockClear();
@@ -317,16 +330,16 @@ describe("diagnostics-otel service", () => {
     const calls = telemetryState.tracer.startSpan.mock.calls;
     const messageCall = calls.find((call) => call[0] === "openclaw.message.processed");
     const usageCall = calls.find((call) => call[0] === "openclaw.model.usage");
+    const rootSpan = telemetryState.spans.find((span) => span.name === "feishu.inbound.receive");
 
     expect(messageCall?.[2]).toEqual(expect.objectContaining({ span: expect.any(Object) }));
-    expect(usageCall?.[2]).toEqual(expect.objectContaining({ span: expect.any(Object) }));
-    expect(usageCall?.[1]).toEqual(
+    expect(usageCall).toBeUndefined();
+    expect(rootSpan?.addEvent).toHaveBeenCalledWith(
+      "openclaw.model.usage",
       expect.objectContaining({
-        attributes: expect.objectContaining({
-          "openclaw.tokens.input": 10,
-          "openclaw.tokens.output": 5,
-          "openclaw.tokens.total": 15,
-        }),
+        "openclaw.tokens.input": 10,
+        "openclaw.tokens.output": 5,
+        "openclaw.tokens.total": 15,
       }),
     );
 

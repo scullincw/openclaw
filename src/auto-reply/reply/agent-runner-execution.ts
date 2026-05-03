@@ -88,7 +88,7 @@ export type AgentRunLoopResult =
     }
   | { kind: "final"; payload: ReplyPayload };
 
-type StreamSpanKind = "reasoning" | "assistant" | "tool_call";
+type StreamSpanKind = "reasoning" | "assistant";
 
 type StreamSpanState = {
   handle: DiagnosticSpanHandle | null;
@@ -103,8 +103,6 @@ function streamSpanName(kind: StreamSpanKind): string {
       return "openclaw.model.stream.reasoning";
     case "assistant":
       return "openclaw.model.stream.assistant";
-    case "tool_call":
-      return "openclaw.model.stream.tool_call";
   }
 }
 
@@ -505,6 +503,9 @@ export async function runAgentTurnWithFallback(params: {
                               return await (async () => {
                                 let lifecycleTerminalEmitted = false;
                                 try {
+                                  let roundTripEndAttributes:
+                                    | Record<string, string | number | boolean>
+                                    | undefined;
                                   const result = await withDiagnosticSpan(
                                     "openclaw.model.round_trip",
                                     {
@@ -516,8 +517,8 @@ export async function runAgentTurnWithFallback(params: {
                                         ? { session_key: params.sessionKey }
                                         : {}),
                                     },
-                                    async () =>
-                                      await runCliAgent({
+                                    async () => {
+                                      const cliResult = await runCliAgent({
                                         sessionId: params.followupRun.run.sessionId,
                                         sessionKey: params.sessionKey,
                                         agentId: params.followupRun.run.agentId,
@@ -541,41 +542,26 @@ export async function runAgentTurnWithFallback(params: {
                                             bootstrapPromptWarningSignaturesSeen.length - 1
                                           ],
                                         images: params.opts?.images,
-                                      }),
-                                  );
-                                  await withDiagnosticSpan(
-                                    "openclaw.model.response.parse",
-                                    {
-                                      attempt: attemptOrdinal,
-                                      provider,
-                                      model,
-                                      runtime: "cli",
-                                      ...(params.sessionKey
-                                        ? { session_key: params.sessionKey }
-                                        : {}),
-                                    },
-                                    async () => {
+                                      });
                                       bootstrapPromptWarningSignaturesSeen =
                                         resolveBootstrapWarningSignaturesSeen(
-                                          result.meta?.systemPromptReport,
+                                          cliResult.meta?.systemPromptReport,
                                         );
+                                      roundTripEndAttributes = {
+                                        completion_source: "cli_result",
+                                        response_parsed: true,
+                                        system_prompt_report_seen: Boolean(
+                                          cliResult.meta?.systemPromptReport,
+                                        ),
+                                      };
+                                      return cliResult;
+                                    },
+                                    {
+                                      endAttributes: () => roundTripEndAttributes,
                                     },
                                   );
 
                                   resolveFirstToken({ source: "cli_result" });
-                                  await withDiagnosticSpan(
-                                    "openclaw.model.complete",
-                                    {
-                                      attempt: attemptOrdinal,
-                                      provider,
-                                      model,
-                                      source: "cli_result",
-                                      ...(params.sessionKey
-                                        ? { session_key: params.sessionKey }
-                                        : {}),
-                                    },
-                                    async () => {},
-                                  );
                                   const cliText = result.payloads?.[0]?.text?.trim();
                                   if (cliText) {
                                     streamTracker.record("assistant", cliText, {
@@ -666,6 +652,9 @@ export async function runAgentTurnWithFallback(params: {
                             return await (async () => {
                               let attemptCompactionCount = 0;
                               try {
+                                let roundTripEndAttributes:
+                                  | Record<string, string | number | boolean>
+                                  | undefined;
                                 const result = await withDiagnosticSpan(
                                   "openclaw.model.round_trip",
                                   {
@@ -677,8 +666,8 @@ export async function runAgentTurnWithFallback(params: {
                                       ? { session_key: params.sessionKey }
                                       : {}),
                                   },
-                                  async () =>
-                                    await runEmbeddedPiAgent({
+                                  async () => {
+                                    const embeddedResult = await runEmbeddedPiAgent({
                                       ...embeddedContext,
                                       allowGatewaySubagentBinding: true,
                                       trigger: params.isHeartbeat ? "heartbeat" : "user",
@@ -786,18 +775,6 @@ export async function runAgentTurnWithFallback(params: {
                                             streamTracker.finish("reasoning", {
                                               attributes: { source: "tool_start" },
                                             });
-                                            streamTracker.record("tool_call", undefined, {
-                                              source: "agent_event",
-                                              phase,
-                                              ...(name ? { tool_name: name } : {}),
-                                            });
-                                            streamTracker.finish("tool_call", {
-                                              attributes: {
-                                                source: "agent_event",
-                                                phase,
-                                                ...(name ? { tool_name: name } : {}),
-                                              },
-                                            });
                                           }
                                           if (phase === "start" || phase === "update") {
                                             await params.typingSignals.signalToolStart();
@@ -899,48 +876,34 @@ export async function runAgentTurnWithFallback(params: {
                                             };
                                           })()
                                         : undefined,
-                                    }),
-                                );
-                                resolveFirstToken({ source: "run_complete" });
-                                await withDiagnosticSpan(
-                                  "openclaw.model.complete",
-                                  {
-                                    attempt: attemptOrdinal,
-                                    provider,
-                                    model,
-                                    source: "run_complete",
-                                    ...(params.sessionKey
-                                      ? { session_key: params.sessionKey }
-                                      : {}),
-                                  },
-                                  async () => {},
-                                );
-                                await withDiagnosticSpan(
-                                  "openclaw.model.response.parse",
-                                  {
-                                    attempt: attemptOrdinal,
-                                    provider,
-                                    model,
-                                    runtime: "embedded",
-                                    ...(params.sessionKey
-                                      ? { session_key: params.sessionKey }
-                                      : {}),
-                                  },
-                                  async () => {
+                                    });
                                     bootstrapPromptWarningSignaturesSeen =
                                       resolveBootstrapWarningSignaturesSeen(
-                                        result.meta?.systemPromptReport,
+                                        embeddedResult.meta?.systemPromptReport,
                                       );
                                     const resultCompactionCount = Math.max(
                                       0,
-                                      result.meta?.agentMeta?.compactionCount ?? 0,
+                                      embeddedResult.meta?.agentMeta?.compactionCount ?? 0,
                                     );
                                     attemptCompactionCount = Math.max(
                                       attemptCompactionCount,
                                       resultCompactionCount,
                                     );
+                                    roundTripEndAttributes = {
+                                      completion_source: "run_complete",
+                                      response_parsed: true,
+                                      system_prompt_report_seen: Boolean(
+                                        embeddedResult.meta?.systemPromptReport,
+                                      ),
+                                      compaction_count: attemptCompactionCount,
+                                    };
+                                    return embeddedResult;
+                                  },
+                                  {
+                                    endAttributes: () => roundTripEndAttributes,
                                   },
                                 );
+                                resolveFirstToken({ source: "run_complete" });
                                 streamTracker.finishAll({ status: "ok" });
                                 return result;
                               } catch (err) {

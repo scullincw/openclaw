@@ -447,7 +447,13 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
         if (!tracesEnabled) {
           return;
         }
-        const spanAttrs: Record<string, string | number> = {
+        const parentRecord = evt.parentSpanKey
+          ? activeTraceSpans.get(evt.parentSpanKey)
+          : undefined;
+        if (!parentRecord) {
+          return;
+        }
+        const eventAttrs: Record<string, string | number> = {
           ...attrs,
           "openclaw.trace_key": evt.traceKey ?? "",
           "openclaw.parent_span_key": evt.parentSpanKey ?? "",
@@ -459,12 +465,13 @@ export function createDiagnosticsOtelService(): OpenClawPluginService {
           "openclaw.tokens.cache_write": usage.cacheWrite ?? 0,
           "openclaw.tokens.total": usage.total ?? 0,
         };
-
-        const span = spanWithDuration("openclaw.model.usage", spanAttrs, evt.durationMs, {
-          parentSpanKey: evt.parentSpanKey,
-          requireParent: true,
-        });
-        span?.end();
+        if (typeof evt.costUsd === "number") {
+          eventAttrs["openclaw.cost_usd"] = evt.costUsd;
+        }
+        if (typeof evt.durationMs === "number") {
+          eventAttrs["openclaw.duration_ms"] = evt.durationMs;
+        }
+        parentRecord.span.addEvent("openclaw.model.usage", eventAttrs);
       };
 
       const recordWebhookReceived = (
