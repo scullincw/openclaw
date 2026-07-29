@@ -1,0 +1,7 @@
+required_paths=ok (15)
+openclaw_json=ok (26 files)
+openclaw_sqlite=ok
+observability_compose=ok
+grafana_database=ok
+prometheus_data=ok (128 files)
+restore_validation=passed
