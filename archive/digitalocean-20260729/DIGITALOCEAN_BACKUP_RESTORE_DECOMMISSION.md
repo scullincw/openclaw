@@ -7,7 +7,9 @@
 - Services frozen: 2026-07-29T07:27:34Z
 - Source host: `ubuntu-s-2vcpu-4gb-sgp1` (`68.183.180.139`)
 - Encrypted backup: verified
-- Git archive: prepared on `backup/do-decommission-20260729`
+- Git archive: pushed to `backup/do-decommission-20260729`
+- Initial archive commit: `b954411b9d7f8198f3c50adfa1ae179e9e39d21e`
+- Temporary final snapshot: `238948035`
 - DigitalOcean decommission: pending final verification and approval
 
 ## Software Versions
@@ -179,9 +181,10 @@ or authorization code back into the terminal.
 
 Existing snapshot:
 
-| ID          | Name                              | Created              | State            |
-| ----------- | --------------------------------- | -------------------- | ---------------- |
-| `232054942` | `openclaw-pre-migration-20260608` | 2026-06-08T15:54:34Z | Deletion pending |
+| ID          | Name                                       | Created              | State                                  |
+| ----------- | ------------------------------------------ | -------------------- | -------------------------------------- |
+| `232054942` | `openclaw-pre-migration-20260608`          | 2026-06-08T15:54:34Z | Deletion pending                       |
+| `238948035` | `openclaw-final-pre-decommission-20260729` | 2026-07-29T07:38:50Z | Created and verified; deletion pending |
 
 No block storage volumes, Reserved IPs, Cloud Firewalls, load balancers, managed
 databases, App Platform applications, Kubernetes clusters, or container registry
@@ -189,14 +192,14 @@ were found during the pre-decommission inventory.
 
 ## Decommission Log
 
-| Time (UTC)           | Action                                        | Result    |
-| -------------------- | --------------------------------------------- | --------- |
-| 2026-07-29T07:27:34Z | Stopped OpenClaw and observability containers | Completed |
-| Pending              | Created temporary final production snapshot   | Pending   |
-| Pending              | Logged out Tailscale on four Droplets         | Pending   |
-| Pending              | Deleted four Droplets                         | Pending   |
-| Pending              | Deleted existing and temporary snapshots      | Pending   |
-| Pending              | Verified account resource and billing state   | Pending   |
+| Time (UTC)           | Action                                                  | Result    |
+| -------------------- | ------------------------------------------------------- | --------- |
+| 2026-07-29T07:27:34Z | Stopped OpenClaw and observability containers           | Completed |
+| 2026-07-29T07:42:46Z | Created temporary final production snapshot `238948035` | Completed |
+| Pending              | Logged out Tailscale on four Droplets                   | Pending   |
+| Pending              | Deleted four Droplets                                   | Pending   |
+| Pending              | Deleted existing and temporary snapshots                | Pending   |
+| Pending              | Verified account resource and billing state             | Pending   |
 
 The encrypted backup and its validation must remain available until a future
 restore test succeeds on a replacement host.
